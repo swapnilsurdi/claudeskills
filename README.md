@@ -58,16 +58,39 @@ Only Claude subagents are required. All others are optional and auto-detected at
 
 ### Install
 
+Skills are `SKILL.md` files placed in a watched directory — no special install command needed.
+
+**Option 1 — One-liner (user-scoped, works across all projects):**
+
 ```bash
-# Install from this repo
-claude skills install https://github.com/swapnilsurdi/claudeskills/raw/main/smac.skill
+mkdir -p ~/.claude/skills/smac && \
+  curl -fsSL https://raw.githubusercontent.com/swapnilsurdi/claudeskills/main/smac/SKILL.md \
+  -o ~/.claude/skills/smac/SKILL.md
 ```
 
-Or clone and install locally:
+**Option 2 — Clone and copy:**
 
 ```bash
 git clone https://github.com/swapnilsurdi/claudeskills
-claude skills install ./claudeskills/smac.skill
+mkdir -p ~/.claude/skills/smac
+cp claudeskills/smac/SKILL.md ~/.claude/skills/smac/SKILL.md
+```
+
+**Option 3 — Project-scoped** (only active in the current repo, good for team sharing via git):
+
+```bash
+mkdir -p .claude/skills/smac
+cp smac/SKILL.md .claude/skills/smac/SKILL.md
+```
+
+No restart needed — Claude Code watches these directories live. The skill is active in your next message.
+
+**Future: via marketplace** (once published)
+
+```shell
+# Inside a Claude Code session:
+/plugin marketplace add swapnilsurdi/claudeskills
+/plugin install smac@claudeskills
 ```
 
 ### Usage
@@ -114,4 +137,12 @@ Most multi-agent skills use the same model with slightly different prompts. SMAC
 
 ## Adding more skills
 
-This repo will grow. PRs welcome — see the [skill-creator plugin](https://github.com/anthropics/claude-plugins-official) for the authoring workflow.
+This repo will grow. PRs welcome.
+
+To author a skill, install the `skill-creator` plugin:
+
+```shell
+/plugin install skill-creator@claude-plugins-official
+```
+
+Then invoke `/skill-creator:skill-creator` in a Claude Code session to start the guided workflow (draft → eval → iterate → publish).
