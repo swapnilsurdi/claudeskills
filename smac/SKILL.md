@@ -18,96 +18,131 @@ allowed-tools: Read, Bash, Write, Edit, Task, Agent
 
 You are the **orchestrator**. Spawn a diverse council of agents across all available LLM backends, collect their independent outputs, synthesize a consensus — and surface the insights a single model would miss.
 
-**Why this works:** Different models have different training data, architectures, and failure modes. Different personas surface different blind spots. Aggregating across genuine diversity cancels out random errors and reveals true disagreements worth examining. Like polling a council of domain experts instead of asking one.
+**Why this works:** Different models have different training data, architectures, and failure modes. Different personas surface different blind spots. Aggregating across genuine diversity cancels out random errors and reveals true disagreements worth examining.
 
-## Phase 0: Discover Available Backends
+**The cardinal rule:** A false consensus is worse than no answer. If agents fail to produce valid output, abort loudly — never synthesize from silence.
 
-**Tell the user what you're about to spawn before starting.** SMAC takes 5–20 minutes depending on N and model sizes. Set expectations now:
+---
 
-> "Running SMAC with [N] agents across [backends]. This will take roughly [X] minutes. I'll report results when the council finishes."
+## Phase 0: Mode + Backend Discovery
 
-Then run discovery:
+### Step 0a — Pick a mode
+
+| Mode | Agents | When to use |
+|------|--------|-------------|
+| **quick** | 3 agents | Fast sanity check, casual opinion, time-sensitive |
+| **standard** | 5–7 agents | Default — most decisions, brainstorming, analysis |
+| **deep** | 10+ agents | High-stakes, irreversible, or genuinely contested decisions |
+
+Default to **standard** unless the user specifies otherwise or the task is clearly quick/trivial.
+
+### Step 0b — Pre-test every backend before counting it
+
+Detection ≠ dispatch. Probe each backend with a tiny request *before* adding it to the roster. A backend that appears available but fails silently will produce empty output and corrupt your effective N.
 
 ```bash
 SMAC_DIR="/tmp/smac_$(date +%s)"
 mkdir -p "$SMAC_DIR"
 
-echo "Claude subagents: checking Task tool availability..."
-# If you can use the Task tool, Claude subagents are available.
-# If running inside a subagent context, Task may not be available — fall back to Bash-only backends.
+echo "=== Backend Pre-Tests ==="
 
-which ollama &>/dev/null && echo "Ollama: available" && ollama list 2>/dev/null || echo "Ollama: not found"
+# Claude subagents: available if you can invoke the Task tool right now.
+# If you are running inside a subagent context, Task may not be available.
+# Test by checking whether you have it — do NOT assume.
 
-[ -n "$OPENAI_API_KEY" ] && echo "OpenAI: key set — gpt-4o available via curl" || echo "OpenAI: no OPENAI_API_KEY"
+# Ollama: test a real small-model round-trip (use the smallest available model)
+if which ollama &>/dev/null; then
+  OLLAMA_TEST=$(ollama run qwen2.5:3b "Reply with the single word: OK" 2>/dev/null | tr -d '[:space:]')
+  [ "$OLLAMA_TEST" = "OK" ] || echo "$OLLAMA_TEST" | grep -qi "ok" \
+    && echo "Ollama: CONFIRMED" \
+    || echo "Ollama: PROBE FAILED — excluding (got: $OLLAMA_TEST)"
+else
+  echo "Ollama: not installed"
+fi
 
-# Gemini CLI is often rate-limited at free tier — test before counting it in the roster:
-which gemini &>/dev/null && echo "Gemini CLI: installed (test response: $(echo 'hi' | timeout 10 gemini 2>/dev/null | head -1 || echo 'RATE LIMITED or slow — exclude'))" || echo "Gemini CLI: not found"
+# OpenAI: test key validity with a minimal call
+if [ -n "$OPENAI_API_KEY" ]; then
+  OAI_TEST=$(curl -s -o /dev/null -w "%{http_code}" \
+    https://api.openai.com/v1/models \
+    -H "Authorization: Bearer $OPENAI_API_KEY")
+  [ "$OAI_TEST" = "200" ] && echo "OpenAI: CONFIRMED (key valid)" \
+    || echo "OpenAI: PROBE FAILED (HTTP $OAI_TEST) — excluding"
+else
+  echo "OpenAI: no OPENAI_API_KEY"
+fi
 
-[ -n "$OPENROUTER_API_KEY" ] && echo "OpenRouter: key set" || echo "OpenRouter: not set"
+# Gemini CLI: free tier rate-limits aggressively — test before counting
+if which gemini &>/dev/null; then
+  GEMINI_TEST=$(timeout 15 gemini "Reply with the single word: OK" 2>/dev/null | head -1)
+  echo "$GEMINI_TEST" | grep -qi "ok\|sure\|yes" \
+    && echo "Gemini: CONFIRMED" \
+    || echo "Gemini: PROBE FAILED (rate-limited or slow) — excluding"
+else
+  echo "Gemini: not installed"
+fi
 
 echo "Working dir: $SMAC_DIR"
 ```
 
-**Build a roster from what's confirmed working.** Target 5–10 agents total:
+**Build the roster only from backends that CONFIRMED.** Then tell the user before spawning:
 
-| Priority | Backend | Models to use | Notes |
-|----------|---------|---------------|-------|
-| 1st | Claude subagents (Task tool) | haiku (fast/cheap), sonnet (balanced), opus (deep) | Best diversity; use 3–5 if Task available |
-| 2nd | Ollama | qwen3-coder:30b (hard tasks), phi3.5, qwen2.5-coder:7b, gemma2:2b, qwen2.5:3b | Use 2–4; timeout 180s each |
-| 3rd | OpenAI | gpt-4o via curl | 1 agent if OPENAI_API_KEY set |
-| 4th | Gemini CLI | gemini (positional arg) | Only include if test response above succeeded — free tier rate-limits frequently |
+> "Running SMAC [mode] with [N] agents: [confirmed breakdown]. Estimated time: [X] min. Ollama is free/local; Claude costs ~$0.01–0.05/agent. Starting now."
 
-**If Task tool is unavailable** (running inside a subagent): skip Claude subagents, use Ollama + OpenAI + Gemini for all N agents.
+If no backends confirm and Task tool is also unavailable: **stop here** and tell the user — do not fake a SMAC run with a single-thread analysis. That defeats the purpose entirely.
 
-**Minimum viable**: 3 independent agents. Never fewer. If only Ollama is available, pick 3 different models.
+---
 
 ## Phase 1: Understand the Problem
 
-Before generating personas or spawning agents, extract:
+Before generating personas or spawning agents:
 
-1. **Domain**: (e.g., Software Engineering, Travel, Home Design, Business Strategy, Legal, Creative Writing, Life Decisions, Data Science)
-2. **Task type** — choose the aggregation strategy you'll use:
+1. **Domain**: (e.g., Software Engineering, Travel, Home Design, Business Strategy, Legal, Creative Writing, Life Decisions)
+2. **Task type** — pick the aggregation strategy:
    - **Ranking** → Borda count
    - **Recommendation** → semantic grouping + consensus threshold
    - **Decision (binary/multi-choice)** → vote count + argument summary
    - **Synthesis / Open-ended** → synthesis judge pass
    - **Brainstorm** → grouping + valuable outlier detection
-3. **Output schema**: Define what each agent *must* return before spawning. Structure enough to aggregate mechanically.
-4. If the problem is **ambiguous**, ask one clarifying question before spawning. Burning N × tokens on vagueness helps no one.
+3. **Output schema**: Define what each agent *must* return before spawning. If you can't aggregate it mechanically, tighten the schema.
+4. If the problem is **ambiguous**, ask one clarifying question. Burning N × tokens on vagueness is wasteful.
+
+---
 
 ## Phase 2: Generate Domain-Specific Personas
 
-Generate 4 base personas relevant to the domain, then assign one per agent (cycling for N > 4):
+Generate 4 base personas relevant to the domain, cycle for N > 4:
 
 | Archetype | Role | Anti-Sycophancy framing |
 |-----------|------|------------------------|
 | **The Domain Expert** | Deep knowledge, established best practices | "Apply your expertise rigorously — don't hedge" |
 | **The Skeptic / Devil's Advocate** | Finds holes, questions assumptions, surfaces risks | "Your job is to find what everyone else gets wrong" |
 | **The Pragmatist** | What actually works with real constraints | "Ignore theory. What works in the real world?" |
-| **The Visionary / Contrarian** | Challenges conventions, sees non-obvious angles | "Conventional wisdom is your enemy. What does everyone miss?" |
-| **The Edge-Case Hunter** | Rare failures, second-order effects, cascades | "Map what breaks. What are the third-order effects?" |
-| **The User / Recipient** | End-user perspective, human impact | "Optimize for the person who has to live with this decision" |
+| **The Visionary / Contrarian** | Challenges conventions, non-obvious angles | "Conventional wisdom is your enemy. What does everyone miss?" |
+| **The Edge-Case Hunter** | Rare failures, second-order effects | "Map what breaks. What are the third-order effects?" |
+| **The User / Recipient** | End-user perspective, human impact | "Optimize for the person who lives with this decision" |
 
 Adapt these to the domain (e.g., for travel: "The Budget Traveler", "The Safety-First Planner", "The Off-the-Beaten-Path Explorer").
 
+---
+
 ## Phase 3: Spawn All Agents — In Parallel
 
-**CRITICAL**: Start all agents in the same turn. An agent that sees another's output before generating its own destroys statistical independence and collapses into sycophancy.
+**CRITICAL**: Start all agents in the same turn. An agent that sees another's output before generating its own collapses into sycophancy and defeats the entire approach.
 
-Each agent saves output to `$SMAC_DIR/agent_<id>.md`.
+Each agent writes its output to `$SMAC_DIR/agent_<id>.md`.
 
 ---
 
-### Claude Subagents (Task tool — always use these)
+### Claude Subagents (Task tool)
 
-Use `subagent_type: "general-purpose"` with appropriate `model` (haiku/sonnet/opus). Spawn all Claude agents in one `Task` batch.
+Use `subagent_type: "general-purpose"` with appropriate `model` (haiku/sonnet/opus). Spawn all Claude agents in one batch so they run in parallel.
 
 **Agent prompt template:**
 
 ```
 You are [PERSONA NAME]: [one-line description of their unique angle and what they prioritize].
 
-INDEPENDENT ANALYSIS — you are working alone. Do not try to be "balanced" or give the expected answer. 
+INDEPENDENT ANALYSIS — you are working alone. Do not try to be "balanced" or give the expected answer.
 Commit to your perspective. Surface what others will miss.
 
 PROBLEM:
@@ -124,22 +159,23 @@ Write your full response, then save it to: [SMAC_DIR]/agent_[id].md
 
 ---
 
-### Ollama (Bash — run in background)
+### Ollama (Bash)
 
-Write prompt to a temp file, invoke model, capture output:
+**Important:** Pass the prompt as a command-line argument, not via stdin redirection. Background bash jobs get stdin from `/dev/null`, so `< file` produces an empty prompt and a useless response. Use `$(cat file)` as the argument instead.
 
 ```bash
 cat > "$SMAC_DIR/prompt_[id].txt" << 'PROMPT'
 You are [PERSONA]. [PROBLEM]. [OUTPUT SCHEMA]. Be concrete and commit to a stance.
 PROMPT
 
-timeout 180 ollama run [model] < "$SMAC_DIR/prompt_[id].txt" > "$SMAC_DIR/agent_[id].md" 2>&1
-echo "Ollama agent [id] done (exit $?)"
+timeout 180 ollama run [model] "$(cat "$SMAC_DIR/prompt_[id].txt")" \
+  > "$SMAC_DIR/agent_[id].md" 2>&1
+echo "Ollama [model] agent [id]: exit $?"
 ```
 
-Good model choices by task:
-- **Complex reasoning / code**: `qwen3-coder:30b` (slow but strong)
-- **Fast/cheap opinion**: `qwen2.5:3b` or `gemma2:2b`
+Good model choices:
+- **Complex reasoning**: `qwen3-coder:30b` (use `timeout 300` — slow)
+- **Fast opinion**: `qwen2.5:3b` or `gemma2:2b`
 - **General purpose**: `phi3.5` or `qwen2.5-coder:7b`
 
 ---
@@ -151,13 +187,14 @@ cat > "$SMAC_DIR/prompt_gemini.txt" << 'PROMPT'
 You are [PERSONA]. [PROBLEM]. [OUTPUT SCHEMA]. Be concrete and commit to a stance.
 PROMPT
 
-gemini "$(cat "$SMAC_DIR/prompt_gemini.txt")" > "$SMAC_DIR/agent_gemini.md" 2>&1
-echo "Gemini agent done (exit $?)"
+timeout 30 gemini "$(cat "$SMAC_DIR/prompt_gemini.txt")" \
+  > "$SMAC_DIR/agent_gemini.md" 2>&1
+echo "Gemini agent: exit $?"
 ```
 
 ---
 
-### OpenAI via curl (Bash — if OPENAI_API_KEY set)
+### OpenAI via curl (Bash)
 
 ```bash
 PROMPT_TEXT="You are [PERSONA]. [PROBLEM]. [OUTPUT SCHEMA]. Be concrete and commit to a stance."
@@ -165,126 +202,159 @@ PROMPT_TEXT="You are [PERSONA]. [PROBLEM]. [OUTPUT SCHEMA]. Be concrete and comm
 curl -s https://api.openai.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d "$(python3 -c "import json,sys; print(json.dumps({'model':'gpt-4o','temperature':0.8,'messages':[{'role':'user','content': sys.argv[1]}]}))" "$PROMPT_TEXT")" \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])" \
+  -d "$(python3 -c "
+import json, sys
+print(json.dumps({
+  'model': 'gpt-4o',
+  'temperature': 0.8,
+  'messages': [{'role': 'user', 'content': sys.argv[1]}]
+}))" "$PROMPT_TEXT")" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['choices'][0]['message']['content'])" \
   > "$SMAC_DIR/agent_openai.md" 2>&1
-echo "OpenAI agent done (exit $?)"
+echo "OpenAI agent: exit $?"
 ```
 
 ---
 
-### Practical Tips
+## Phase 3.5: Validate Outputs — Quorum Check
 
-- Spawn all Claude subagents in one `Task` call batch → they run truly in parallel
-- Fire all Bash agents (Ollama/Gemini/OpenAI) as parallel Bash calls in the same message
-- Set 3-minute timeout for most Ollama models (`timeout 180`); large 30b models may need 5 min (`timeout 300`)
-- If Gemini hits a rate limit or returns nothing, exclude it and don't retry — note the effective N
-- If an agent returns an empty file or obvious error, exclude from aggregation and note effective N
-- After all agents finish, sanity-check: are any output files empty or clearly truncated?
+**Do this before aggregating anything.** Empty outputs and error messages are not data points — including them silently is the most dangerous failure mode in multi-agent systems.
+
+```bash
+echo "=== Output Validation ==="
+VALID_COUNT=0
+for f in "$SMAC_DIR"/agent_*.md; do
+  SIZE=$(wc -c < "$f" 2>/dev/null || echo 0)
+  # Check for common failure patterns
+  if [ "$SIZE" -lt 100 ]; then
+    echo "EXCLUDED $f — too short (${SIZE} bytes, likely empty or error)"
+  elif grep -qi "rate.limit\|quota\|error\|not logged in\|unauthorized\|refused" "$f"; then
+    echo "EXCLUDED $f — contains error indicator"
+    mv "$f" "${f}.failed"
+  else
+    echo "OK $f (${SIZE} bytes)"
+    VALID_COUNT=$((VALID_COUNT + 1))
+  fi
+done
+echo "Valid outputs: $VALID_COUNT"
+```
+
+**If VALID_COUNT < 3: ABORT.**
+
+Do not synthesize. Tell the user:
+
+> "SMAC quorum not reached: only [N] of [total] agents produced valid output. This is not enough for meaningful consensus — a false answer is worse than no answer. Try again with: [specific fix — e.g., 'check Ollama is running', 'verify API key', 'use quick mode with Claude-only']"
+
+Only proceed to Phase 4 if VALID_COUNT ≥ 3.
+
+---
 
 ## Phase 4: Collect and Aggregate
 
-Once all agents complete, read all `$SMAC_DIR/agent_*.md` files.
+Read all *valid* `$SMAC_DIR/agent_*.md` files (skip `.failed` files).
 
-Track for each output: which backend, which model, which persona, and key claims made.
+Track for each: backend, model, persona, key claims.
 
 ### Aggregation by Task Type
 
 **Ranking (Borda Count):**
-1st = N pts, 2nd = N-1 pts, ... last = 1 pt. Sum across agents per option. Rank by total.
+1st = N pts, 2nd = N-1 pts, ... last = 1 pt. Sum per option across valid agents.
 
 **Recommendation (Grouping):**
-- Group semantically similar ideas (same recommendation, different wording)
-- **Consensus** (≥60% agents): High confidence — safe bet
-- **Divergence** (30-60%): Genuine judgment call — flag for user decision
-- **Valuable Outlier** (<30%): Flag if proposed by Skeptic, Domain Expert, or Edge-Case Hunter with strong reasoning — minority-but-correct ideas are gold
+- **Consensus** (≥60% of valid agents): High confidence
+- **Divergence** (30–60%): Genuine judgment call — flag for user
+- **Valuable Outlier** (<30%): Flag if endorsed by Skeptic, Domain Expert, or Edge-Case Hunter with strong reasoning
 
 **Decision (Vote):**
-Count votes per option. Report split + strongest argument from each side.
+Count per option. Report split + strongest argument from each side.
 
 **Synthesis / Brainstorm:**
-Proceed to Phase 5 (synthesis judge).
+Proceed to Phase 5.
 
 ### Always Surface
 
-- Do disagreements correlate with model/backend (systematic bias)? Or with persona (genuine judgment call)?
+- Do disagreements correlate with model/backend (systematic bias) or with persona (genuine judgment call)?
 - What does the Skeptic see that optimists missed?
-- Is there a Valuable Outlier — a minority idea endorsed by a specialized persona with a compelling argument?
+- Is there a Valuable Outlier — minority idea endorsed by a specialized persona with a compelling argument?
 
-## Phase 5: Synthesis (for Synthesis/Brainstorm tasks)
+---
 
-When aggregation alone is insufficient, run one final synthesis pass using the **strongest available model** (Claude opus preferred; else sonnet; else best available):
+## Phase 5: Synthesis Pass
+
+For Synthesis/Brainstorm tasks, or when aggregation alone is insufficient, run one final synthesis using the **strongest available model** (opus preferred; else sonnet):
 
 ```
-You are synthesizing [N] independent expert analyses of the following problem.
+You are synthesizing [N] independent expert analyses.
 
 PROBLEM: [problem]
 
-ANALYSES:
-[all agent outputs, labeled by persona]
+ANALYSES (labeled by persona and backend):
+[all valid agent outputs]
 
 YOUR TASK:
 1. What do most agents agree on? (consensus — the safe foundation)
-2. Where do they genuinely disagree? (divergence — real judgment calls needing human input)
+2. Where do they genuinely disagree? (divergence — real judgment calls for the human)
 3. Is there a minority insight that's high-impact even if few agents raised it?
 4. Produce a SYNTHESIS — not a summary, but a response better than any individual agent.
 
 Do NOT average everything together. Preserve the strongest specific insights.
-Explicitly call out where you think the majority is wrong — and if the majority made a clear factual or logical error, override them with transparent disclosure: state what the majority concluded, why it is wrong, and what the correct answer is. An honest override is more valuable than a false consensus.
+If the majority made a clear factual or logical error, override them — but disclose it:
+state what the majority said, why it's wrong, and what the correct answer is.
+An honest override is more valuable than a false consensus.
 ```
 
-## Phase 6: Final Output
+---
 
-**Always present this structure:**
+## Phase 6: Final Output
 
 ```markdown
 # SMAC Report
 
 **Problem**: [problem]
-**Agents**: [N total] — [breakdown: e.g., "3× Claude (haiku/sonnet/opus), 2× Ollama (qwen3-coder, phi3.5), 1× Gemini"]
+**Mode**: [quick / standard / deep]
+**Agents**: [valid N] of [attempted N] — [breakdown by backend/model]
 **Task type**: [ranking / recommendation / decision / synthesis / brainstorm]
 
 ## Consensus ([X]/[N] agents agree)
 [Main finding — what the council converged on. Be specific.]
 
 ## Key Divergence
-[The most interesting split. What each side argues. Why it's a genuine judgment call — not just noise.]
+[The most interesting split. What each side argues. Why it's a genuine judgment call.]
 
 ## Valuable Outlier
-[The minority idea worth examining. Which agent proposed it. Why it might matter despite being unpopular.]
+[The minority idea worth examining. Which agent/persona proposed it. Why it might matter.]
 
 ## Orchestrator Synthesis
-[Your synthesized recommendation, integrating the council's best insights. Take a stance.]
+[Your synthesized recommendation. Take a stance.]
 
 ---
-*Full agent outputs: [SMAC_DIR]/agent_*.md*
-*Effective N: [N] (note any failed agents)*
+*Agent outputs: [SMAC_DIR]/agent_*.md*
+*Failed agents: [list any .failed files and why]*
 ```
+
+---
 
 ## Configuration
 
-| Parameter | Default | How to override |
-|-----------|---------|-----------------|
-| N agents | 5–10 based on discovery | "use 15 agents", "spawn 3 agents" |
+| Parameter | Default | Override |
+|-----------|---------|---------|
+| Mode | standard (5–7 agents) | "quick smac", "deep smac", "use 3 agents" |
 | Synthesis model | opus (if available) | "use sonnet for synthesis" |
-| Agent models | auto-selected by backend | "only use haiku", "use qwen3-coder:30b for all ollama" |
-| Min N | 3 | cannot lower |
+| Agent models | auto-selected by backend | "only use haiku", "use qwen3-coder for ollama agents" |
+| Min valid quorum | 3 | cannot lower — abort instead |
+
+---
 
 ## Edge Cases
 
-- **Only Claude available**: Use haiku×2 + sonnet×2 + opus×1 = 5 agents. Still genuinely diverse.
-- **Ambiguous prompt**: Ask ONE clarifying question. Don't spawn on vagueness.
-- **No consensus**: Report the split honestly — this IS the finding. The problem has no dominant answer. Give the user the strongest arguments from each side.
-- **All agents agree (unanimity)**: Report as high-confidence consensus and note unanimity explicitly.
-- **Ollama slow or timeout**: Note the agent as excluded, report effective N used.
-- **Agent returns garbage**: Exclude from aggregation, note effective N.
-- **User specifies N > 10**: Honor it but note cost implications (especially for large Ollama models or paid APIs).
-
-## Cost Awareness
-
-Tell the user what you're about to spawn before starting:
-> "Spawning [N] agents: [breakdown]. Ollama is free/local. Claude costs ~$0.01–0.05/agent depending on model."
-
-For expensive tasks (many agents × long outputs):
-- Prefer haiku + smaller Ollama models for proposers
-- Reserve opus/gpt-4o for synthesis only
+- **Only Claude available**: haiku×2 + sonnet×2 + opus×1 = 5 agents. Still genuinely diverse.
+- **Ambiguous prompt**: Ask ONE clarifying question before spawning.
+- **No consensus**: Report the split — this IS the finding. Give the strongest arguments from each side.
+- **Unanimity**: Report as high-confidence and note it explicitly.
+- **Quorum failure (<3 valid outputs)**: Abort. Do not synthesize. Explain what failed and how to fix it.
+- **All Ollama agents time out**: Reduce to faster models (qwen2.5:3b, gemma2:2b) or drop to quick mode.
+- **Gemini rate-limited**: It failed the pre-test and should not be in the roster — exclude silently.
+- **N > 10 requested**: Honor it, note cost and time implications upfront.
