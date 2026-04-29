@@ -90,6 +90,59 @@ echo "Working dir: $SMAC_DIR"
 
 If no backends confirm and Task tool is also unavailable: **stop here** and tell the user — do not fake a SMAC run with a single-thread analysis. That defeats the purpose entirely.
 
+### Step 0c — Load Prior Learnings
+
+SMAC improves over time by remembering which models made which kinds of errors. Load the learnings file before building agent prompts:
+
+```bash
+LEARNINGS_FILE="$HOME/.claude/smac/learnings.jsonl"
+mkdir -p "$HOME/.claude/smac"
+
+if [ -f "$LEARNINGS_FILE" ]; then
+  echo "=== Prior Learnings ==="
+  # Show recent entries (last 30 days) relevant to confirmed backends
+  python3 - "$LEARNINGS_FILE" << 'PY'
+import json, sys
+from datetime import datetime, timezone, timedelta
+
+cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+entries = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+            ts = datetime.fromisoformat(e.get("timestamp","").replace("Z","+00:00"))
+            if ts >= cutoff:
+                entries.append(e)
+        except Exception:
+            pass
+
+if not entries:
+    print("No recent learnings.")
+else:
+    # Group by backend/model
+    by_backend = {}
+    for e in entries:
+        key = e.get("backend","unknown")
+        by_backend.setdefault(key, []).append(e)
+    for backend, items in by_backend.items():
+        print(f"\n{backend} ({len(items)} past issue(s)):")
+        for item in items[-3:]:  # show up to 3 most recent per backend
+            print(f"  [{item.get('error_type','?')}] {item.get('lesson', item.get('description',''))}")
+PY
+else
+  echo "No learnings file yet — this will be created after the first run."
+fi
+```
+
+Use the loaded learnings to:
+1. **Flag known-unreliable backends** for the current domain — note them in the roster but mark with ⚠️
+2. **Inject relevant warnings into the synthesis prompt** (e.g., "Note: phi3.5 has previously made spatial reasoning errors on home design tasks — weight its geometric claims cautiously")
+3. **Not** exclude backends solely based on past failures — one bad run doesn't disqualify a model, but it should raise the scrutiny bar
+
 ---
 
 ## Phase 1: Understand the Problem
@@ -291,6 +344,10 @@ You are synthesizing [N] independent expert analyses.
 
 PROBLEM: [problem]
 
+[If learnings from Phase 0c are relevant to any of these backends, include them here:]
+KNOWN MODEL ISSUES (from prior runs):
+[e.g., "ollama/phi3.5 has previously made spatial reasoning errors on home design tasks — weigh its geometric claims carefully"]
+
 ANALYSES (labeled by persona and backend):
 [all valid agent outputs]
 
@@ -334,6 +391,102 @@ An honest override is more valuable than a false consensus.
 *Agent outputs: [SMAC_DIR]/agent_*.md*
 *Failed agents: [list any .failed files and why]*
 ```
+
+---
+
+## Phase 6.5: Record Learnings
+
+After every run — successful or not — record what happened so future runs start smarter. This is what makes SMAC get better over time rather than repeating the same failures.
+
+**Always run this.** Even a perfect run is worth recording (it confirms a backend is reliable).
+
+```bash
+LEARNINGS_FILE="$HOME/.claude/smac/learnings.jsonl"
+RUN_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+```
+
+### What to record
+
+**1. Any agent that was excluded or failed (Phase 3.5):**
+
+```bash
+for f in "$SMAC_DIR"/agent_*.failed; do
+  [ -f "$f" ] || continue
+  BACKEND=$(basename "$f" | sed 's/agent_//' | sed 's/\.md\.failed//')
+  ERROR_CONTENT=$(head -5 "$f")
+  # Classify the failure type
+  echo "$ERROR_CONTENT" | grep -qi "rate.limit\|quota" && ERROR_TYPE="rate_limit" || \
+  echo "$ERROR_CONTENT" | grep -qi "timeout" && ERROR_TYPE="timeout" || \
+  echo "$ERROR_CONTENT" | grep -qi "unauthorized\|401\|not logged in" && ERROR_TYPE="auth_failure" || \
+  ERROR_TYPE="output_failure"
+
+  python3 - << PY >> "$LEARNINGS_FILE"
+import json
+print(json.dumps({
+  "timestamp": "$RUN_TIMESTAMP",
+  "run_id": "smac_$(date +%s)",
+  "domain": "[DOMAIN from Phase 1]",
+  "task_type": "[TASK TYPE from Phase 1]",
+  "backend": "$BACKEND",
+  "error_type": "$ERROR_TYPE",
+  "description": "Agent excluded during quorum check",
+  "lesson": "Verify $BACKEND is available before counting it in the roster for [DOMAIN] tasks",
+  "severity": "medium",
+  "confirmed_by": "quorum_validation"
+}))
+PY
+done
+```
+
+**2. Any orchestrator override (you corrected a majority error in Phase 5):**
+
+If you overrode the majority during synthesis, record what the majority got wrong and which model(s) drove it:
+
+```python
+# Write one entry per model that contributed to the wrong majority
+import json
+entry = {
+  "timestamp": "[RUN_TIMESTAMP]",
+  "run_id": "smac_[timestamp]",
+  "domain": "[DOMAIN]",
+  "task_type": "[TASK_TYPE]",
+  "backend": "[backend/model that led the wrong majority — e.g., 'ollama/phi3.5']",
+  "error_type": "systematic_bias",
+  "description": "[One sentence: what the majority concluded and why it was wrong]",
+  "lesson": "[One sentence: what to watch for when this backend handles this domain in future]",
+  "severity": "high",
+  "confirmed_by": "orchestrator_override"
+}
+# Append to learnings file
+with open(f"{home}/.claude/smac/learnings.jsonl", "a") as f:
+    f.write(json.dumps(entry) + "\n")
+```
+
+**3. User explicitly flags something as wrong (after presenting the report):**
+
+If the user says "that advice was bad" or "agent X was clearly wrong", record it:
+
+```python
+entry = {
+  "timestamp": "[RUN_TIMESTAMP]",
+  "backend": "[backend/model the user flagged]",
+  "error_type": "user_rejected",
+  "description": "[what the agent claimed]",
+  "lesson": "[what the user said was actually correct]",
+  "severity": "high",
+  "confirmed_by": "user_feedback"
+}
+```
+
+### What NOT to record
+
+- Agents that simply disagreed with the majority but weren't *wrong* — dissent is a feature
+- Timeouts on large Ollama models when running complex tasks — that's expected behavior, not a bug
+- One-off failures that are clearly environmental (network blip, Gemini free tier)
+
+### Pruning
+
+The learnings file is append-only and will grow. The load step (Phase 0c) already filters to the last 30 days. No manual pruning needed.
 
 ---
 
