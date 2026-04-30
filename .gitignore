@@ -1,0 +1,5 @@
+.env
+.venv/
+smac-workspace/
+eval_set.json
+smac_negative_evals.txt

@@ -1,16 +1,15 @@
 ---
 name: smac
 description: >
-  Stochastic Multi-Agent Consensus (SMAC) — automatically discovers ALL available LLM backends
-  (Claude haiku/sonnet/opus subagents, local Ollama models, OpenAI GPT-4o via curl, Gemini CLI)
-  and spawns a diverse council of expert personas to independently analyze any problem, then
-  synthesizes a consensus answer stronger than any single model. Use for decisions, brainstorming,
-  travel planning, furniture arrangement, legal questions, technical architecture, creative work,
-  life advice, or ANY situation where multiple perspectives add value. ALWAYS trigger on: "smac",
-  "stochastic consensus", "poll agents", "get multiple opinions", "what do different AIs think",
-  "multi-agent vote", "brainstorm with agents", "council of agents", "consensus on", "diverse
-  perspectives on", or /smac. Also trigger when the user wants to stress-test an idea, compare
-  options, or asks "what would you say if you were [different persona]".
+  Use this skill when the user is weighing multiple options, torn between named alternatives, or
+  wants different expert perspectives on a decision — especially where reasonable people would
+  disagree. Trigger on: "smac", "/smac", "poll agents", "get consensus", "what do different AIs
+  think", "stress-test this", "torn between", "debating", "how do I decide", "different takes",
+  "what would experts say". Covers tech choices (stack, architecture, tooling), business strategy
+  (pricing, hiring, prioritization), life decisions (jobs, travel, career pivots), creative
+  direction (naming, branding, design), and any question where the value is in surfacing
+  disagreement rather than a single answer. Do NOT trigger for factual lookups, code writing,
+  debugging, or single-correct-answer questions.
 allowed-tools: Read, Bash, Write, Edit, Task, Agent
 ---
 
